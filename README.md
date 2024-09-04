@@ -54,7 +54,3 @@ Anda dapat menyesuaikan value masing-masing setiap objek berdasarkan database an
 
 
 Response akan mengembalikan hasil perhitungan nilai esai mahasiswa terhadap jawaban dosen.
-
-## Lisensi
-
-Proyek ini dilisensikan di bawah lisensi MIT - lihat file [LICENSE](LICENSE) untuk detail lebih lanjut.
