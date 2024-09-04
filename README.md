@@ -45,12 +45,13 @@ Untuk menjalankan proyek ini secara lokal, ikuti langkah-langkah berikut:
 ## Penggunaan
 
 Untuk menggunakan API, Anda dapat mengirimkan POST request ke endpoint `/compare-essay/` dengan data dalam format JSON seperti berikut:
-
+Anda dapat menyesuaikan value masing-masing setiap objek berdasarkan database anda.
 {
     "cuserid": ["TS13313aA"],
     "pertemuan": [1],
     "cacademic_year": ["2013/2014"]
 }
+
 
 Response akan mengembalikan hasil perhitungan nilai esai mahasiswa terhadap jawaban dosen.
 
