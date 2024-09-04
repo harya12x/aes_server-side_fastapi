@@ -25,19 +25,20 @@ Untuk menjalankan proyek ini secara lokal, ikuti langkah-langkah berikut:
 2. **Buat Virtual Environment**
    python -m venv venv
    source venv/bin/activate  # Untuk macOS/Linux
-   .\venv\Scripts\activate  # Untuk Windows
    
-3. **Instal Dependensi**
-   pip install -r requirements.txt
+   .\venv\Scripts\activate  # Untuk Windows 
+   
+4. **Instal Dependensi**
+   pip install -r requirements (Example)
 
-4. **Setup Database**
+5. **Setup Database**
    - Sesuaikan konfigurasi database di file `database.py` sesuai dengan setup Anda.
    - Jalankan migrasi atau buat database baru.
 
-5. **Jalankan Aplikasi**
+6. **Jalankan Aplikasi**
    uvicorn main:app --reload
 
-6. **Akses API**
+7. **Akses API**
    - Aplikasi akan berjalan di `http://127.0.0.1:8000`.
    - Anda dapat mengakses dokumentasi API di `http://127.0.0.1:8000/docs`.
 
