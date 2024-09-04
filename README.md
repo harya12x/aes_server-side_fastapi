@@ -55,16 +55,6 @@ Anda dapat menyesuaikan value masing-masing setiap objek berdasarkan database an
 
 Response akan mengembalikan hasil perhitungan nilai esai mahasiswa terhadap jawaban dosen.
 
-## Kontribusi
-
-Jika Anda ingin berkontribusi pada proyek ini:
-
-1. Fork repository ini.
-2. Buat branch fitur (`git checkout -b fitur/AmazingFeature`).
-3. Commit perubahan Anda (`git commit -m 'Menambahkan fitur yang luar biasa'`).
-4. Push ke branch (`git push origin fitur/AmazingFeature`).
-5. Buat Pull Request.
-
 ## Lisensi
 
 Proyek ini dilisensikan di bawah lisensi MIT - lihat file [LICENSE](LICENSE) untuk detail lebih lanjut.
