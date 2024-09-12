@@ -7,19 +7,18 @@ import re
 from typing import List, Dict, Tuple, AsyncGenerator
 import asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
-from database import SessionLocal, Base  # Import from your database setup file
-from models import AnswerDosen, AnswerMahasiswa  # Import your models
+from database import SessionLocal
+from models import AnswerDosen, AnswerMahasiswa
 from fastapi.middleware.cors import CORSMiddleware
-from spellchecker import SpellChecker
 import nltk
 from nltk.corpus import stopwords
+from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
 
 origins = [
     "http://localhost",
     "http://127.0.0.1",
-    # Tambahkan domain lain jika diperlukan
 ]
 
 app.add_middleware(
@@ -29,68 +28,39 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# Load pre-trained IndoBERT model and tokenizer once
+
+# Load pre-trained DistilBERT model and tokenizer once
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-tokenizer = AutoTokenizer.from_pretrained("indobenchmark/indobert-large-p2")
-model = AutoModel.from_pretrained("indobenchmark/indobert-large-p2").to(device)
+tokenizer = AutoTokenizer.from_pretrained("indobenchmark/indobert-base-p1")
+model = AutoModel.from_pretrained("indobenchmark/indobert-base-p1").to(device)
 
 nltk.download('stopwords')
-nltk.download('punkt')
-
 STOP_WORDS = set(stopwords.words('indonesian'))
-spell = SpellChecker()
 
-def get_text_embedding(text: str) -> np.ndarray:
-    inputs = tokenizer(text, return_tensors='pt', padding=True, truncation=True).to(device)
+def get_text_embedding(texts: Tuple[str]) -> np.ndarray:
+    inputs = tokenizer(list(texts), return_tensors='pt', padding=True, truncation=True).to(device)
     with torch.no_grad():
         outputs = model(**inputs)
-    embeddings = outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
+    embeddings = outputs.last_hidden_state.mean(dim=1).cpu().numpy()
     return embeddings
 
 def preprocess_text(text: str) -> str:
-    text = re.sub(r'\d+', '', text)
-    return text
+    return re.sub(r'\d+\.\s*', '', text.lower())
 
-def dot_product_calculate(vec1: np.ndarray, vec2: np.ndarray) -> float:
-    return np.dot(vec1, vec2)
+def chunk_text(text: str, chunk_size: int = 512) -> List[str]:
+    words = text.split()
+    return [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
 
-def norm_calculate(vec: np.ndarray) -> float:
-    return np.linalg.norm(vec)
+def calculate_cosine_similarity_bert(embedding1: np.ndarray, embedding2: np.ndarray) -> Dict[str, float]:
+    dot_product = np.dot(embedding1, embedding2.T)  # Transpose embedding2 to align dimensions
+    norm_vec1 = np.linalg.norm(embedding1)
+    norm_vec2 = np.linalg.norm(embedding2)
 
-def cosine_similarity(tokens1: List[str], tokens2: List[str]) -> Tuple[float, float, float, float]:
-    unique_tokens = list(set(tokens1) | set(tokens2))
-    freq_vec1 = np.array([tokens1.count(token) for token in unique_tokens])
-    freq_vec2 = np.array([tokens2.count(token) for token in unique_tokens])
-
-    dot_product = dot_product_calculate(freq_vec1, freq_vec2)
-    norm_vec1 = norm_calculate(freq_vec1)
-    norm_vec2 = norm_calculate(freq_vec2)
-    
     if norm_vec1 == 0 or norm_vec2 == 0:
-        raise ValueError("One of the vectors has norm 0, cosine similarity is undefined.")
-    
-    cosine_sim = dot_product / (norm_vec1 * norm_vec2)
-    
-    return dot_product, cosine_sim, norm_vec1, norm_vec2
+        cosine_sim = 0.0
+    else:
+        cosine_sim = dot_product / (norm_vec1 * norm_vec2)
 
-def cosine_similarity_bert(vec1: np.ndarray, vec2: np.ndarray) -> Tuple[float, float, float, float]:
-    dot_product = dot_product_calculate(vec1, vec2)
-    norm_vec1 = norm_calculate(vec1)
-    norm_vec2 = norm_calculate(vec2)
-    
-    if norm_vec1 == 0 or norm_vec2 == 0:
-        raise ValueError("One of the vectors has norm 0, cosine similarity is undefined.")
-    
-    cosine_sim = dot_product / (norm_vec1 * norm_vec2)
-    
-    return dot_product, cosine_sim, norm_vec1, norm_vec2
-
-def calculate_cosine_similarity_bert(text1: str, text2: str) -> Dict[str, float]:
-    embedding1 = get_text_embedding(text1)
-    embedding2 = get_text_embedding(text2)
-    
-    dot_product, cosine_sim, norm_vec1, norm_vec2 = cosine_similarity_bert(embedding1, embedding2)
-    
     return {
         'dotProduct': float(dot_product),
         'length1': float(norm_vec1),
@@ -98,21 +68,41 @@ def calculate_cosine_similarity_bert(text1: str, text2: str) -> Dict[str, float]
         'cosineSimilarity': float(cosine_sim)
     }
 
-
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with SessionLocal() as session:
         yield session
+
+def process_mahasiswa(jawaban_mahasiswa, embeddings_dosen):
+    cleaned_text = preprocess_text(jawaban_mahasiswa.cfile)
+    chunked_texts = chunk_text(cleaned_text)
+    embeddings = np.mean([get_text_embedding(tuple([chunk])) for chunk in chunked_texts], axis=0)
+    nilai = calculate_cosine_similarity_bert(embeddings_dosen, embeddings)
+    return {
+        'npm': jawaban_mahasiswa.npm,
+        'jawaban_mahasiswa': cleaned_text,
+        'score': nilai['cosineSimilarity']
+    }
+
+async def process_mahasiswa_batch(jawaban_mahasiswa_batch, embeddings_dosen):
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor() as pool:
+        tasks = [loop.run_in_executor(pool, process_mahasiswa, jawaban, embeddings_dosen) for jawaban in jawaban_mahasiswa_batch]
+        results = await asyncio.gather(*tasks)
+    return results
 
 @app.post("/compare-essay/")
 async def compare_essay(request: Request, db: AsyncSession = Depends(get_db)):
     request_data = await request.json()
 
-    if 'cuserid' in request_data and 'pertemuan' in request_data and 'cacademic_year' in request_data:
+    if 'cuserid' in request_data and 'pertemuan' in request_data and 'cacademic_year' in request_data and 'pages' in request_data:
         cuser_id = request_data['cuserid'][0]
         pertemuan = request_data['pertemuan'][0]
         cacademic_year = request_data['cacademic_year'][0]
+        page = request_data['pages'][0]
+        page_size = 3  # Set the number of items per page
 
         try:
+            # Fetching data from the database
             jawaban_dosen_result = await db.execute(
                 select(AnswerDosen).filter_by(cuserid=cuser_id, pertemuan=pertemuan, cacademic_year=cacademic_year)
             )
@@ -122,52 +112,36 @@ async def compare_essay(request: Request, db: AsyncSession = Depends(get_db)):
                 raise HTTPException(detail="Jawaban dosen tidak ditemukan")
 
             jawaban_mahasiswa_result = await db.execute(
-                select(AnswerMahasiswa)
-                .filter_by(cuserid=cuser_id, pertemuan=pertemuan, cacademic_year=cacademic_year)
+                select(AnswerMahasiswa).filter_by(cuserid=cuser_id, pertemuan=pertemuan, cacademic_year=cacademic_year)
             )
             jawaban_mahasiswa = jawaban_mahasiswa_result.scalars().all()
 
             if not jawaban_mahasiswa:
                 raise HTTPException(status_code=404, detail="Jawaban mahasiswa tidak ditemukan")
 
-            tokens_dosen = re.findall(r'\w+', jawaban_dosen.answer_text.lower())
-            keywords = list(set(tokens_dosen) - STOP_WORDS)
+            # Preprocess texts
+            cleaned_text_dosen = preprocess_text(jawaban_dosen.answer_text)
+            chunked_texts_dosen = chunk_text(cleaned_text_dosen)
+            embeddings_dosen = np.mean([get_text_embedding(tuple([chunk])) for chunk in chunked_texts_dosen], axis=0)
 
-            async def process_student_answer(jawaban):
-                npm = jawaban.npm
-                regex_text = re.sub(r'\b\d+\.\s*', '', jawaban.cfile)
-                regex_text_dosen = re.sub(r'\b\d+\.\s*', '', jawaban_dosen.answer_text)
+            # Pagination logic
+            start_index = (page - 1) * page_size
+            end_index = start_index + page_size
+            paginated_jawaban_mahasiswa = jawaban_mahasiswa[start_index:end_index]
 
-               
-             
-                nilai = calculate_cosine_similarity_bert(jawaban_dosen.answer_text, regex_text)
-
-               
-
-                return {
-                    'kd_matkul': cuser_id,
-                    'npm': npm,
-                    'jawaban_dosen': regex_text_dosen,
-                    'jawaban_mahasiswa': regex_text,
-                    'score': nilai
-                }
-
-            tasks = [process_student_answer(jawaban) for jawaban in jawaban_mahasiswa]
-            all_results = await asyncio.gather(*tasks)
+            # Process mahasiswa answers in batches
+            results = await process_mahasiswa_batch(paginated_jawaban_mahasiswa, embeddings_dosen)
 
             return {
                 "message": "Berhasil menghitung nilai",
-                "data": all_results,
-                "total_data": len(jawaban_mahasiswa)
+                "data": results,
+                "total_data": len(jawaban_mahasiswa),
+                "page": page,
+                "page_size": page_size,
+                "total_pages": (len(jawaban_mahasiswa) + page_size - 1) // page_size
             }
 
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
     else:
         raise HTTPException(status_code=400, detail="Gagal menghitung nilai")
-
-
-
-
-
-
