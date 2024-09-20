@@ -104,8 +104,8 @@ class EssayComparer:
         
         scores = self.subjective_evaluator.evaluate(cleaned_lecturer_text, cleaned_student_text)
         
-        weights = {'similarity': 0.6, 'relevance': 0.2, 'coherence': 0.1, 'grammar': 0.1}
-        final_score = sum(weights[key] * scores[key] for key in weights)
+        weights = {'similarity': 0.6, 'relevance': 0.2, 'coherence': 0.2}
+        final_score = sum(weights[key] * scores[key] for key in weights if key in scores)
         
         return {
             'student_id': student_answer.npm,
@@ -136,16 +136,20 @@ class EssayComparer:
         page_size = 3
 
         try:
-            lecturer_answer = await db.execute(
+            # Perbaikan di sini
+            result = await db.execute(
                 select(LecturerAnswer).filter_by(cuserid=cuser_id, pertemuan=pertemuan, cacademic_year=cacademic_year)
-            ).scalar_one_or_none()
+            )
+            lecturer_answer = result.scalar_one_or_none()
 
             if not lecturer_answer:
                 raise HTTPException(status_code=404, detail="Lecturer answer not found")
 
-            student_answers = await db.execute(
+            # Perbaikan di sini juga
+            result = await db.execute(
                 select(StudentAnswer).filter_by(cuserid=cuser_id, pertemuan=pertemuan, cacademic_year=cacademic_year)
-            ).scalars().all()
+            )
+            student_answers = result.scalars().all()
 
             if not student_answers:
                 raise HTTPException(status_code=404, detail="Student answers not found")
