@@ -4,7 +4,7 @@ Automatic Essay Scorring API adalah sebuah layanan web berbasis FastAPI yang dig
 
 # Fitur
 
-- **Cosine Similarity Calculation**: Menghitung kesamaan makna antara jawaban dosen dan mahasiswa menggunakan model IndoBERT.
+- **Cosine Similarity Calculation**: Menghitung kesamaan, relevansi, dan koherensi antara jawaban dosen dan mahasiswa menggunakan model IndoBERT.
 - **Optimized Text Processing**: Menggunakan prapemrosesan teks yang efisien untuk mempercepat komputasi.
 - **Asynchronous Processing**: Memproses beberapa esai mahasiswa secara asynchronous untuk meningkatkan performa.
 
