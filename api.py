@@ -21,12 +21,35 @@ import re
 import signal
 import sys
 
-def signal_handler(sig, frame):
-    print("Shutting down gracefully...")
-    # Perform cleanup here
-    sys.exit(0)
+from contextlib import asynccontextmanager
 
-signal.signal(signal.SIGINT, signal_handler)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await startup_event()
+    yield
+    await shutdown_event()
+
+app = FastAPI(lifespan=lifespan)
+
+# Tambahkan fungsi shutdown event
+async def shutdown_event():
+    print("Shutting down gracefully...")
+    # Lakukan pembersihan di sini jika diperlukan
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    [task.cancel() for task in tasks]
+    await asyncio.gather(*tasks, return_exceptions=True)
+    print("Shutdown complete.")
+
+# Tambahkan event handler untuk startup dan shutdown
+@app.on_event("startup")
+async def startup_event():
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown_event()))
+
+@app.on_event("shutdown")
+async def shutdown():
+    await shutdown_event()
 
 class TextProcessor:
     def __init__(self):
