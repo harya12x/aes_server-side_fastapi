@@ -184,6 +184,7 @@ class EssayComparer:
 
             return {
                 "message": "Successfully calculated scores",
+                "status_code": 200,
                 "data": results,
                 "total_data": len(student_answers),
                 "page": page,
