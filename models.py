@@ -3,7 +3,7 @@ from sqlalchemy.ext.declarative import declarative_base
 
 Base = declarative_base()
 
-class AnswerMahasiswa(Base):
+class StudentAnswer(Base):
     __tablename__ = "se_course_student_file"
     nid = Column(Integer, primary_key=True, index=True, autoincrement=True)
     nid_section_file = Column(Integer)
@@ -17,7 +17,7 @@ class AnswerMahasiswa(Base):
     npoint = Column(Float)
     cacademic_year = Column(String(11))
 
-class AnswerDosen(Base):
+class LecturerAnswer(Base):
     __tablename__ = "se_upload_dosen"
     nid = Column(Integer, primary_key=True, index=True, autoincrement=True)
     nid_section_file = Column(Text)

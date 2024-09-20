@@ -1,18 +1,171 @@
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks
 from sqlalchemy.future import select
-from transformers import AutoTokenizer, AutoModel
-import numpy as np
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer
 import torch
-import re
-from typing import List, Dict, Tuple, AsyncGenerator
+import numpy as np
+from typing import List, Dict, AsyncGenerator
 import asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 from database import SessionLocal
-from models import AnswerDosen, AnswerMahasiswa
+from models import LecturerAnswer, StudentAnswer
 from fastapi.middleware.cors import CORSMiddleware
-import nltk
-from nltk.corpus import stopwords
 from concurrent.futures import ThreadPoolExecutor
+import logging
+import json
+from datasets import Dataset
+from sklearn.model_selection import train_test_split
+import pandas as pd
+import os
+from sentence_transformers import SentenceTransformer
+import re
+import signal
+import sys
+
+def signal_handler(sig, frame):
+    print("Shutting down gracefully...")
+    # Perform cleanup here
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+class TextProcessor:
+    def __init__(self):
+        self.tokenizer = AutoTokenizer.from_pretrained("indobenchmark/indobert-base-p1")
+
+    def preprocess_text(self, text: str) -> str:
+        tokens = self.tokenizer.tokenize(text)
+        words = []
+        for token in tokens:
+            if token.startswith('##'):
+                words[-1] += token[2:]
+            else:
+                words.append(token)
+        return ' '.join(words)
+
+class SubjectiveEvaluator:
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # NLI model for classification
+        self.nli_model_name = "LazarusNLP/indobert-lite-base-p1-indonli-multilingual-nli-distil-mdeberta"
+        self.nli_tokenizer = AutoTokenizer.from_pretrained(self.nli_model_name)
+        self.nli_model = AutoModelForSequenceClassification.from_pretrained(self.nli_model_name).to(self.device)
+        
+        # SentenceTransformer model for sentence embedding
+        self.sentence_model = SentenceTransformer("cassador/indobert-base-p2-nli-v1")
+        self.negation_words = ["tidak", "bukan", "tanpa", "belum", "jangan"]
+        self.exception_phrases = ["tidak hanya", "tidak lain", "tidak lain tidak bukan"]
+        self.negation_pattern = re.compile(r'\b(?:' + '|'.join(self.negation_words) + r')\s+\w{4,}')
+
+    def detect_negation(self, text: str) -> bool:
+        text = text.lower()
+        if any(phrase in text for phrase in self.exception_phrases):
+            return False
+        return bool(self.negation_pattern.search(text))
+
+    def cosine_similarity(self, vec1, vec2):
+        return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+
+    def evaluate(self, lecturer_text: str, student_text: str) -> Dict[str, float]:
+        # NLI evaluation
+        inputs = self.nli_tokenizer(lecturer_text, student_text, return_tensors='pt', padding=True, truncation=True, max_length=512).to(self.device)
+        
+        with torch.no_grad():
+            nli_outputs = self.nli_model(**inputs)
+
+        nli_scores = torch.softmax(nli_outputs.logits, dim=1).squeeze().tolist()
+        
+        # Sentence embedding similarity
+        embedding_lecturer = self.sentence_model.encode(lecturer_text)
+        embedding_student = self.sentence_model.encode(student_text)
+        semantic_similarity = self.cosine_similarity(embedding_lecturer, embedding_student) * 100
+
+        # Combine NLI and semantic similarity
+        nli_similarity = (1 - nli_scores[2]) * 100  # Inverse of contradiction score
+        combined_similarity = (nli_similarity + semantic_similarity) / 2
+        
+        # Negation detection
+        if self.detect_negation(lecturer_text) != self.detect_negation(student_text):
+            combined_similarity *= 0.1
+        
+        return {
+            'similarity': combined_similarity,
+            'relevance': semantic_similarity,
+            'coherence': min(combined_similarity, 100),
+        }
+
+class EssayComparer:
+    def __init__(self, text_processor: TextProcessor, subjective_evaluator: SubjectiveEvaluator):
+        self.text_processor = text_processor
+        self.subjective_evaluator = subjective_evaluator
+
+    def process_student(self, student_answer, lecturer_answer):
+        cleaned_student_text = self.text_processor.preprocess_text(student_answer.cfile)
+        cleaned_lecturer_text = self.text_processor.preprocess_text(lecturer_answer.answer_text)
+        
+        scores = self.subjective_evaluator.evaluate(cleaned_lecturer_text, cleaned_student_text)
+        
+        weights = {'similarity': 0.6, 'relevance': 0.2, 'coherence': 0.1, 'grammar': 0.1}
+        final_score = sum(weights[key] * scores[key] for key in weights)
+        
+        return {
+            'student_id': student_answer.npm,
+            'student_answer': cleaned_student_text,
+            'lecturer_answer': cleaned_lecturer_text,
+            'score': round(final_score, 2),
+            'detail': {key: round(value, 2) for key, value in scores.items()}
+        }
+
+    async def process_student_batch(self, student_answer_batch, lecturer_answer):
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as pool:
+            tasks = [loop.run_in_executor(pool, self.process_student, answer, lecturer_answer) for answer in student_answer_batch]
+            results = await asyncio.gather(*tasks)
+        return results
+
+    async def compare_essay(self, request: Request, db: AsyncSession):
+        try:
+            request_data = await request.json()
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON in request body")
+
+        required_fields = ['cuserid', 'pertemuan', 'cacademic_year', 'pages']
+        if not all(field in request_data for field in required_fields):
+            raise HTTPException(status_code=400, detail="Missing required fields")
+
+        cuser_id, pertemuan, cacademic_year, page = (request_data[field][0] for field in required_fields)
+        page_size = 3
+
+        try:
+            lecturer_answer = await db.execute(
+                select(LecturerAnswer).filter_by(cuserid=cuser_id, pertemuan=pertemuan, cacademic_year=cacademic_year)
+            ).scalar_one_or_none()
+
+            if not lecturer_answer:
+                raise HTTPException(status_code=404, detail="Lecturer answer not found")
+
+            student_answers = await db.execute(
+                select(StudentAnswer).filter_by(cuserid=cuser_id, pertemuan=pertemuan, cacademic_year=cacademic_year)
+            ).scalars().all()
+
+            if not student_answers:
+                raise HTTPException(status_code=404, detail="Student answers not found")
+
+            start_index = (page - 1) * page_size
+            paginated_student_answers = student_answers[start_index:start_index + page_size]
+
+            results = await self.process_student_batch(paginated_student_answers, lecturer_answer)
+
+            return {
+                "message": "Successfully calculated scores",
+                "data": results,
+                "total_data": len(student_answers),
+                "page": page,
+                "page_size": page_size,
+                "total_pages": (len(student_answers) + page_size - 1) // page_size
+            }
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
 app = FastAPI()
 
@@ -29,119 +182,102 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load pre-trained DistilBERT model and tokenizer once
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-tokenizer = AutoTokenizer.from_pretrained("indobenchmark/indobert-base-p1")
-model = AutoModel.from_pretrained("indobenchmark/indobert-base-p1").to(device)
-
-nltk.download('stopwords')
-STOP_WORDS = set(stopwords.words('indonesian'))
-
-def get_text_embedding(texts: Tuple[str]) -> np.ndarray:
-    inputs = tokenizer(list(texts), return_tensors='pt', padding=True, truncation=True).to(device)
-    with torch.no_grad():
-        outputs = model(**inputs)
-    embeddings = outputs.last_hidden_state.mean(dim=1).cpu().numpy()
-    return embeddings
-
-def preprocess_text(text: str) -> str:
-    return re.sub(r'\d+\.\s*', '', text.lower())
-
-def chunk_text(text: str, chunk_size: int = 512) -> List[str]:
-    words = text.split()
-    return [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
-
-def calculate_cosine_similarity_bert(embedding1: np.ndarray, embedding2: np.ndarray) -> Dict[str, float]:
-    dot_product = np.dot(embedding1, embedding2.T)  # Transpose embedding2 to align dimensions
-    norm_vec1 = np.linalg.norm(embedding1)
-    norm_vec2 = np.linalg.norm(embedding2)
-
-    if norm_vec1 == 0 or norm_vec2 == 0:
-        cosine_sim = 0.0
-    else:
-        cosine_sim = dot_product / (norm_vec1 * norm_vec2)
-
-    return {
-        'dotProduct': float(dot_product),
-        'length1': float(norm_vec1),
-        'length2': float(norm_vec2),
-        'cosineSimilarity': float(cosine_sim)
-    }
-
+text_processor = TextProcessor()
+subjective_evaluator = SubjectiveEvaluator()
+essay_comparer = EssayComparer(text_processor, subjective_evaluator)
+    
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with SessionLocal() as session:
         yield session
 
-def process_mahasiswa(jawaban_mahasiswa, embeddings_dosen):
-    cleaned_text = preprocess_text(jawaban_mahasiswa.cfile)
-    chunked_texts = chunk_text(cleaned_text)
-    embeddings = np.mean([get_text_embedding(tuple([chunk])) for chunk in chunked_texts], axis=0)
-    nilai = calculate_cosine_similarity_bert(embeddings_dosen, embeddings)
-    return {
-        'npm': jawaban_mahasiswa.npm,
-        'jawaban_mahasiswa': cleaned_text,
-        'score': nilai['cosineSimilarity']
-    }
-
-async def process_mahasiswa_batch(jawaban_mahasiswa_batch, embeddings_dosen):
-    loop = asyncio.get_event_loop()
-    with ThreadPoolExecutor() as pool:
-        tasks = [loop.run_in_executor(pool, process_mahasiswa, jawaban, embeddings_dosen) for jawaban in jawaban_mahasiswa_batch]
-        results = await asyncio.gather(*tasks)
-    return results
-
 @app.post("/compare-essay/")
-async def compare_essay(request: Request, db: AsyncSession = Depends(get_db)):
-    request_data = await request.json()
+async def compare_essay_endpoint(request: Request, db: AsyncSession = Depends(get_db)):
+    return await essay_comparer.compare_essay(request, db)
 
-    if 'cuserid' in request_data and 'pertemuan' in request_data and 'cacademic_year' in request_data and 'pages' in request_data:
-        cuser_id = request_data['cuserid'][0]
-        pertemuan = request_data['pertemuan'][0]
-        cacademic_year = request_data['cacademic_year'][0]
-        page = request_data['pages'][0]
-        page_size = 3  # Set the number of items per page
+class ModelTrainer:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model_name = "indobenchmark/indobert-base-p1"
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name, num_labels=4)
 
-        try:
-            # Fetching data from the database
-            jawaban_dosen_result = await db.execute(
-                select(AnswerDosen).filter_by(cuserid=cuser_id, pertemuan=pertemuan, cacademic_year=cacademic_year)
-            )
-            jawaban_dosen = jawaban_dosen_result.scalar_one_or_none()
+    async def get_training_data(self):
+        student_result = await self.db.execute(select(StudentAnswer))
+        lecturer_result = await self.db.execute(select(LecturerAnswer))
+        
+        student_answers = student_result.scalars().all()
+        lecturer_answers = {answer.pertemuan: answer for answer in lecturer_result.scalars().all()}
+        
+        training_data = []
+        for student_answer in student_answers:
+            lecturer_answer = lecturer_answers.get(student_answer.pertemuan)
+            if lecturer_answer:
+                training_data.append({
+                    'student_essay': student_answer.cfile,
+                    'lecturer_essay': lecturer_answer.answer_text,
+                    # Assume there's a score column, if not, you need to adjust this
+                    'score': getattr(student_answer, 'score', 0)  
+                })
+        
+        return training_data
 
-            if not jawaban_dosen:
-                raise HTTPException(detail="Jawaban dosen tidak ditemukan")
+    def tokenize_function(self, examples):
+        return self.tokenizer(examples["combined_essay"], padding="max_length", truncation=True, max_length=512)
 
-            jawaban_mahasiswa_result = await db.execute(
-                select(AnswerMahasiswa).filter_by(cuserid=cuser_id, pertemuan=pertemuan, cacademic_year=cacademic_year)
-            )
-            jawaban_mahasiswa = jawaban_mahasiswa_result.scalars().all()
+    async def fine_tune(self):
+        training_data = await self.get_training_data()
+        df = pd.DataFrame(training_data)
+        
+        if not df.empty:
+            df['combined_essay'] = df.apply(lambda row: f"Student: {row['student_essay']} Lecturer: {row['lecturer_essay']}", axis=1)
+        else:
+            print("DataFrame is empty. Cannot add combined_essay column.")
 
-            if not jawaban_mahasiswa:
-                raise HTTPException(status_code=404, detail="Jawaban mahasiswa tidak ditemukan")
+        train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
+        
+        train_dataset = Dataset.from_pandas(train_df)
+        val_dataset = Dataset.from_pandas(val_df)
+        
+        tokenized_train = train_dataset.map(self.tokenize_function, batched=True)
+        tokenized_val = val_dataset.map(self.tokenize_function, batched=True)
+        
+        training_args = TrainingArguments(
+            output_dir="./results",
+            num_train_epochs=3,
+            per_device_train_batch_size=8,
+            per_device_eval_batch_size=8,
+            warmup_steps=500,
+            weight_decay=0.01,
+            logging_dir="./logs",
+            logging_steps=10,
+            evaluation_strategy="epoch",
+        )
+        
+        trainer = Trainer(
+            model=self.model,
+            args=training_args,
+            train_dataset=tokenized_train,
+            eval_dataset=tokenized_val,
+        )
+        
+        trainer.train()
+        
+        self.model.save_pretrained("./fine_tuned_indobert_essay_scorer")
+        self.tokenizer.save_pretrained("./fine_tuned_indobert_essay_scorer")
 
-            # Preprocess texts
-            cleaned_text_dosen = preprocess_text(jawaban_dosen.answer_text)
-            chunked_texts_dosen = chunk_text(cleaned_text_dosen)
-            embeddings_dosen = np.mean([get_text_embedding(tuple([chunk])) for chunk in chunked_texts_dosen], axis=0)
+@app.post("/fine-tune-model/")
+async def fine_tune_model(background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+    try:
+        background_tasks.add_task(run_fine_tuning)
+        return {"message": "Fine-tuning started in the background"}
+    except Exception as e:
+        return {"error": f"Failed to start fine-tuning: {str(e)}"}
 
-            # Pagination logic
-            start_index = (page - 1) * page_size
-            end_index = start_index + page_size
-            paginated_jawaban_mahasiswa = jawaban_mahasiswa[start_index:end_index]
-
-            # Process mahasiswa answers in batches
-            results = await process_mahasiswa_batch(paginated_jawaban_mahasiswa, embeddings_dosen)
-
-            return {
-                "message": "Berhasil menghitung nilai",
-                "data": results,
-                "total_data": len(jawaban_mahasiswa),
-                "page": page,
-                "page_size": page_size,
-                "total_pages": (len(jawaban_mahasiswa) + page_size - 1) // page_size
-            }
-
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-    else:
-        raise HTTPException(status_code=400, detail="Gagal menghitung nilai")
+async def run_fine_tuning():
+    try:
+        print("Starting fine-tuning process...")
+        # Implement fine-tuning process here
+        print("Fine-tuning process completed.")
+    except Exception as e:
+        print(f"Error during fine-tuning: {str(e)}")
